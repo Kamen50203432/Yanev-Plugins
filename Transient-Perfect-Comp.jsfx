@@ -1,0 +1,186 @@
+desc: Transient-Perfect Comp
+author: Kamen Yanev
+
+version: 1.0
+
+slider1:0<-60,0,0.1>Threshold (dB)
+slider2:4<1,20,0.1>Ratio
+slider3:10<0,100,0.1>Transient Time (Detector Delay ms)
+slider4:10<0.1,100,0.1>Attack (ms)
+slider5:0<0,50,0.1>Hold (ms)
+slider6:100<10,500,1>Release (ms)
+slider7:0<-20,20,0.1>Output Gain (dB)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+ext_tail_size = -1;
+freemem = 0; // Reset the memory pointer so buffer addresses stay stable across re-inits (avoids the pointer creeping forward on every @init re-run)
+log2db = 8.6858896380650365530225783783321; // 20 / ln(10)
+db2log = 0.11512925464970228420089957273422; // ln(10) / 20 
+
+// Initialize the detector buffer using freemem
+buf_size = srate * 0.15; 
+buf_L = freemem; 
+buf_R = buf_L + buf_size + 1;
+freemem = buf_R + buf_size + 1;
+
+buf_index = 0;
+
+// Smoothed Gain Reduction variables
+gr_smooth = 1.0;
+hold_counter = 0;
+
+// Variable for visual smoothing of the meter
+gr_meter_visual = 1.0;
+
+@slider
+thresh_db = slider1;
+thresh_lin = exp(thresh_db * db2log);
+ratio = slider2;
+
+// Detector delay in samples (Transient Time)
+delay_samples = min(floor((slider3 / 1000) * srate), buf_size - 1);
+
+// Time constants
+att_coeff = 1 - exp(-1 / ((slider4 / 1000) * srate));
+hold_samples = floor((slider5 / 1000) * srate);
+rel_coeff = 1 - exp(-1 / ((slider6 / 1000) * srate));
+
+makeup_lin = exp(slider7 * db2log);
+
+@sample
+// 1. Write the instantaneous (clean) input into the buffer
+buf_L[buf_index] = spl0;
+buf_R[buf_index] = spl1;
+
+// 2. Read the DELAYED copy for the detector
+detect_index = buf_index - delay_samples;
+detect_index < 0 ? detect_index += buf_size;
+
+delayed_detect_L = buf_L[detect_index];
+delayed_detect_R = buf_R[detect_index];
+
+// Advance the buffer index
+buf_index += 1;
+buf_index >= buf_size ? buf_index = 0;
+
+// 3. The detector takes the instantaneous absolute peak value of the delayed signal
+rectified_input = max(abs(delayed_detect_L), abs(delayed_detect_R));
+
+// 4. Calculate the current Gain Reduction target
+target_gr = 1.0;
+rectified_input > thresh_lin ? (
+  overshoot = rectified_input / thresh_lin;
+  target_gr = overshoot ^ ((1 / ratio) - 1);
+);
+
+// 5. Apply Attack/Release directly to the Gain Reduction, blocking premature release
+// Check whether there's a strong signal at the immediate input that hasn't reached the detector yet
+immediate_input = max(abs(spl0), abs(spl1));
+immediate_input > thresh_lin ? (
+  // If there's an actual incoming transient, don't let the release raise the level (trigger Hold)
+  hold_counter = max(hold_counter, delay_samples);
+);
+
+target_gr < gr_smooth ? (
+  // Attack (reducing the gain): reacts immediately
+  gr_smooth += att_coeff * (target_gr - gr_smooth);
+  hold_counter = max(hold_counter, hold_samples);
+) : (
+  // Release logic (bringing the gain back to 1.0)
+  hold_counter > 0 ? (
+    hold_counter -= 1;
+  ) : (
+    gr_smooth += rel_coeff * (target_gr - gr_smooth);
+  );
+);
+
+// 6. Apply the processed Gain Reduction to the ORIGINAL signal
+spl0 = spl0 * gr_smooth * makeup_lin;
+spl1 = spl1 * gr_smooth * makeup_lin;
+
+// 7. Store the instantaneous value for the graph
+gr_meter = gr_smooth;
+
+
+@gfx 0 32
+// Calculate the real current reduction in dB (exactly accurate relative to the audio)
+gr_db_real = log(max(gr_meter, 0.00001)) * log2db;
+
+// Calculate the current visual level in dB
+gr_db_vis = log(max(gr_meter_visual, 0.00001)) * log2db;
+
+// FIX: The visual meter follows the real one smoothly in both directions,
+// but never lags behind on a fast return upward (solves sluggishness below -3dB)
+gr_db_real < gr_db_vis ? (
+  // When the compressor is pushing down, the visual meter follows the REAL attack speed of the audio
+  gr_db_vis = gr_db_real;
+) : (
+  // When returning upward (Release), the visual meter moves back at the faster of the two rates:
+  // either the REAL release speed from the compressor (gr_db_real), or a minimum constant speed (so it doesn't stall)
+  release_step = gr_db_real - gr_db_vis;
+  gr_db_vis = min(0, gr_db_vis + max(release_step * 0.3, 1.5)); 
+);
+
+// Convert the visual value back to linear scale for the next frame
+gr_meter_visual = exp(gr_db_vis * db2log);
+
+// FIX / RESCALE: Continuous segmented scale, now with 3 ranges:
+// 0..-12dB = 55% of the bar, -12..-24dB = the next 25% (80% total up to -24dB),
+// -24..-96dB = the last 20%. This puts -24dB near the left edge instead of the middle,
+// and 3/6/12 dB read with much more detail. The boundaries (-12 and -24) give the same
+// value from both adjacent formulas, so the scale stays continuous with no jump.
+gr_db_vis > -12 ? (
+  meter_w = gfx_w * 0.55 * (gr_db_vis / -12);
+) : gr_db_vis > -24 ? (
+  meter_w = gfx_w * (0.55 + 0.25 * ((gr_db_vis + 12) / -12));
+) : (
+  meter_w = gfx_w * (0.80 + 0.20 * (max(gr_db_vis, -96) + 24) / -72);
+);
+meter_w = min(gfx_w, max(0, meter_w));
+
+// 1. Draw the red GR meter
+gfx_r = 0.8; gfx_g = 0.1; gfx_b = 0.1; gfx_a = 0.8;
+gfx_y = 0;
+gfx_x = gfx_w - meter_w;
+gfx_rectto(gfx_w, gfx_h);
+
+// 2. Draw the vertical tick lines and print the dB values above them
+// (fixed markers at 3, 6, 12 and 24 dB, computed using the same continuous segmented scale)
+tick_index = 0;
+while (
+  tick_index == 0 ? tick_db = -3;
+  tick_index == 1 ? tick_db = -6;
+  tick_index == 2 ? tick_db = -12;
+  tick_index == 3 ? tick_db = -24;
+
+  tick_db > -12 ? (
+    tick_x = gfx_w - gfx_w * 0.55 * (tick_db / -12);
+  ) : tick_db > -24 ? (
+    tick_x = gfx_w - gfx_w * (0.55 + 0.25 * ((tick_db + 12) / -12));
+  ) : (
+    tick_x = gfx_w - gfx_w * (0.80 + 0.20 * (tick_db + 24) / -72);
+  );
+
+  tick_x > 0 ? (
+    gfx_r = 1.0; gfx_g = 1.0; gfx_b = 1.0; gfx_a = 0.15;
+    gfx_line(tick_x, 0, tick_x, gfx_h);
+    
+    gfx_r = 1.0; gfx_g = 1.0; gfx_b = 1.0; gfx_a = 0.4;
+    gfx_x = tick_x - 4;
+    gfx_y = 2;
+    gfx_drawnumber(abs(tick_db), 0);
+  );
+
+  tick_index += 1;
+  tick_index < 4;
+);
+
+// 3. Print the exact clean numeric value on the left
+gfx_r = gfx_g = gfx_b = 1.0; gfx_a = 0.9;
+gfx_x = 10; gfx_y = gfx_h / 2 - gfx_texth / 2;
+gfx_drawnumber(gr_db_real, 1);
