@@ -1,0 +1,291 @@
+desc:Transient Accent
+author: Kamen Yanev
+
+version: 1.0
+slider1:det_hp_freq=20<20,20000,1:log>Detection Min Freq (Hz)
+slider2:det_lp_freq=20000<20,20000,1:log>Detection Max Freq (Hz)
+slider3:attack_ms=0.1<0.01,2.5,0.001>Attack Time (ms)
+slider4:thresh_db=-20<-60,0,0.1>Threshold (dB)
+slider5:target_above_db=6<0,24,0.1>Target Boost Above Thresh (dB)
+slider6:transient_ms=10<0.5,100,0.1>Transient Time (ms)
+slider7:rearm_hyst_db=3.0<0.0,12.0,0.1>Re-arm Hysteresis (dB)
+slider8:out_gain_db=0<-24,24,0.1>Output Gain (dB)
+
+@init
+state_idle       = 0;
+state_accent     = 1;
+state_wait_below = 2;
+
+state = state_idle;
+current_gain = 1.0;
+det_env = 0;
+captured_peak = 0;
+
+log10_factor = 8.685889638065036;
+
+// Filter history state
+hp_x1 = hp_x2 = hp_y1 = hp_y2 = 0;
+lp_x1 = lp_x2 = lp_y1 = lp_y2 = 0;
+
+// GFX Scroll Buffer Configuration
+buf_size = 400;       
+buf_env  = 21000;     
+buf_gain = 22000;     
+buf_pos  = 0;
+downsample_cnt = 0;
+
+@slider
+thresh_lin           = 10 ^ (thresh_db / 20);
+rearm_thresh_lin     = thresh_lin * (10 ^ (-rearm_hyst_db / 20));
+target_above_lin     = 10 ^ (target_above_db / 20);
+target_transient_lin = thresh_lin * target_above_lin;
+out_gain_lin         = 10 ^ (out_gain_db / 20);
+
+pdc_delay = 0; // Pure Zero-Latency
+
+// Anti-pop safety floor on attack smoothing (prevents 1-sample gain jumps)
+safe_attack_ms = max(attack_ms, 0.05);
+att_coeff      = 1 - exp(-1 / (srate * (safe_attack_ms / 1000))); 
+rel_coeff      = 1 - exp(-1 / (srate * 0.008)); 
+det_rel_coeff  = exp(-1 / (srate * 0.015));
+
+// 1. Enforce minimum 50 Hz filter band separation to stop filter collapse & ringing pops
+hp_f = min(det_hp_freq, det_lp_freq - 50);
+hp_f = max(hp_f, 20);
+
+lp_f = max(det_lp_freq, hp_f + 50);
+lp_f = min(lp_f, 20000);
+
+// Detection High-Pass Filter
+w0_hp = 2 * $pi * hp_f / srate;
+cos_hp = cos(w0_hp); sin_hp = sin(w0_hp);
+alpha_hp = sin_hp / (2 * 0.7071);
+
+b0_hp = (1 + cos_hp) / 2; b1_hp = -(1 + cos_hp); b2_hp = (1 + cos_hp) / 2;
+a0_hp = 1 + alpha_hp; a1_hp = -2 * cos_hp; a2_hp = 1 - alpha_hp;
+
+hp_b0 = b0_hp / a0_hp; hp_b1 = b1_hp / a0_hp; hp_b2 = b2_hp / a0_hp;
+hp_a1 = a1_hp / a0_hp; hp_a2 = a2_hp / a0_hp;
+
+// Detection Low-Pass Filter
+w0_lp = 2 * $pi * lp_f / srate;
+cos_lp = cos(w0_lp); sin_lp = sin(w0_lp);
+alpha_lp = sin_lp / (2 * 0.7071);
+
+b0_lp = (1 - cos_lp) / 2; b1_lp = 1 - cos_lp; b2_lp = (1 - cos_lp) / 2;
+a0_lp = 1 + alpha_lp; a1_lp = -2 * cos_lp; a2_lp = 1 - alpha_lp;
+
+lp_b0 = b0_lp / a0_lp; lp_b1 = b1_lp / a0_lp; lp_b2 = b2_lp / a0_lp;
+lp_a1 = a1_lp / a0_lp; lp_a2 = a2_lp / a0_lp;
+
+downsample_limit = max(1, floor(srate / 167));
+
+@sample
+raw_peak = max(abs(spl0), abs(spl1));
+
+// Live Sidechain Detection
+hp_out = hp_b0 * raw_peak + hp_b1 * hp_x1 + hp_b2 * hp_x2 - hp_a1 * hp_y1 - hp_a2 * hp_y2;
+hp_x2 = hp_x1; hp_x1 = raw_peak; hp_y2 = hp_y1; hp_y1 = hp_out;
+
+lp_out = lp_b0 * hp_out + lp_b1 * lp_x1 + lp_b2 * lp_x2 - lp_a1 * lp_y1 - lp_a2 * lp_y2;
+lp_x2 = lp_x1; lp_x1 = hp_out; lp_y2 = lp_y1; lp_y1 = lp_out;
+
+det_sig = abs(lp_out);
+det_env = max(det_sig, det_env * det_rel_coeff);
+
+// State Machine with Peak-Hold Lock
+state == state_idle ? (
+  det_env > thresh_lin ? (
+    state = state_accent;
+    transient_samples_left = (transient_ms / 1000) * srate;
+    captured_peak = det_env;
+  );
+) : state == state_accent ? (
+  // Lock to the highest peak reached during the accent hit
+  captured_peak = max(captured_peak, det_env);
+  transient_samples_left -= 1;
+  transient_samples_left <= 0 ? (
+    state = state_wait_below;
+  );
+) : state == state_wait_below ? (
+  det_env < rearm_thresh_lin ? (
+    state = state_idle;
+  );
+);
+
+// Uncapped Reactive Normalization
+state == state_accent ? (
+  eff_peak = max(captured_peak, thresh_lin);
+  target_gain = target_transient_lin / eff_peak;
+  
+  // Micro-smoothed attack prevents instantaneous 1-sample clicks
+  current_gain += att_coeff * (target_gain - current_gain);
+) : (
+  target_gain = 1.0;
+  current_gain += rel_coeff * (target_gain - current_gain);
+);
+
+// Visual Buffers
+downsample_cnt += 1;
+downsample_cnt >= downsample_limit ? (
+  downsample_cnt = 0;
+  buf_pos = (buf_pos + 1) % buf_size;
+  buf_env[buf_pos]  = raw_peak;
+  buf_gain[buf_pos] = current_gain;
+);
+
+// Direct Output
+spl0 = spl0 * current_gain * out_gain_lin;
+spl1 = spl1 * current_gain * out_gain_lin;
+
+@gfx 800 450
+gfx_r = 0.09; gfx_g = 0.11; gfx_b = 0.13;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+bar_w = 40;
+graph_w = gfx_w - bar_w;
+
+center_y = gfx_h / 2;
+max_height = (gfx_h / 2) - 15;
+
+min_db = -60;
+max_db = 24;
+db_range = max_db - min_db;
+
+// Left Scale Bar
+gfx_r = 0.06; gfx_g = 0.07; gfx_b = 0.09;
+gfx_rect(0, 0, bar_w, gfx_h);
+
+gfx_r = 0.22; gfx_g = 0.25; gfx_b = 0.28;
+gfx_line(bar_w, 0, bar_w, gfx_h);
+
+curr_db = -60;
+while (curr_db <= 24) (
+  norm_db = (curr_db - min_db) / db_range;
+  offset_y = norm_db * max_height;
+  tick_y = center_y - offset_y;
+
+  gfx_r = 0.35; gfx_g = 0.40; gfx_b = 0.45;
+  gfx_line(bar_w - 5, tick_y, bar_w, tick_y);
+
+  sprintf(#db_str, "%d", curr_db);
+  gfx_measurestr(#db_str, str_w, str_h);
+  
+  gfx_r = curr_db > 0 ? 0.95 : 0.60;
+  gfx_g = curr_db > 0 ? 0.45 : 0.65;
+  gfx_b = curr_db > 0 ? 0.25 : 0.70;
+  
+  gfx_x = bar_w - 8 - str_w;
+  gfx_y = tick_y - (str_h / 2);
+  gfx_drawstr(#db_str);
+
+  curr_db += 12;
+);
+
+// Main Visualizer
+gfx_r = 0.22; gfx_g = 0.25; gfx_b = 0.28;
+gfx_line(bar_w, center_y, gfx_w, center_y);
+
+thresh_clamped = max(min_db, min(max_db, thresh_db));
+thresh_norm = (thresh_clamped - min_db) / db_range;
+thresh_offset = thresh_norm * max_height;
+
+thresh_y_top = center_y - thresh_offset;
+thresh_y_bot = center_y + thresh_offset;
+
+gfx_r = 0.9; gfx_g = 0.75; gfx_b = 0.2;
+dot_x = bar_w;
+while (dot_x < gfx_w) (
+  gfx_line(dot_x, thresh_y_top, min(dot_x + 4, gfx_w), thresh_y_top);
+  gfx_line(dot_x, thresh_y_bot, min(dot_x + 4, gfx_w), thresh_y_bot);
+  dot_x += 8;
+);
+
+phase_shift = downsample_cnt / downsample_limit;
+
+i = 0;
+has_prev = 0;
+
+loop(buf_size,
+  idx = (buf_pos + 1 + i) % buf_size;
+  x = bar_w + ((i - phase_shift) / (buf_size - 1)) * graph_w;
+  
+  env_val = buf_env[idx];
+
+  vis_gain_val = 1.0;
+  max_dev = 0;
+  win_k = -4;
+  weight_sum = 0;
+  weighted_gain_sum = 0;
+  
+  while (win_k <= 4) (
+    k_idx = (buf_pos + 1 + i + win_k + buf_size) % buf_size;
+    k_gain = buf_gain[k_idx];
+    k_dev = abs(k_gain - 1.0);
+    
+    w = exp(-0.3 * win_k * win_k);
+    weighted_gain_sum += k_gain * w;
+    weight_sum += w;
+    
+    k_dev > max_dev ? max_dev = k_dev;
+    win_k += 1;
+  );
+  
+  max_dev > 0.0005 ? (
+    vis_gain_val = weighted_gain_sum / weight_sum;
+  ) : (
+    vis_gain_val = 1.0;
+  );
+
+  env_db = env_val > 0.000001 ? (log(env_val) * log10_factor) : -80;
+  env_db_clamped = max(min_db, min(max_db, env_db));
+  env_amp = ((env_db_clamped - min_db) / db_range) * max_height;
+  
+  y_env_top = center_y - env_amp;
+  y_env_bot = center_y + env_amp;
+  
+  gain_db = vis_gain_val > 0.000001 ? (log(vis_gain_val) * log10_factor) : 0;
+  boosted_db = env_db + gain_db; 
+  boosted_db_clamped = max(min_db, min(max_db, boosted_db));
+  boost_amp = ((boosted_db_clamped - min_db) / db_range) * max_height;
+  
+  y_gain_top = center_y - boost_amp;
+  y_gain_bot = center_y + boost_amp;
+
+  abs(vis_gain_val - 1.0) > 0.0005 ? (
+    gfx_r = 1.0; gfx_g = 0.48; gfx_b = 0.1;
+    gfx_line(x, y_env_top, x, y_gain_top);
+    gfx_line(x, y_env_bot, x, y_gain_bot);
+    has_prev ? (
+      gfx_line(prev_x, prev_y_gain_top, x, y_gain_top);
+      gfx_line(prev_x, prev_y_gain_bot, x, y_gain_bot);
+    );
+  );
+
+  i > 0 ? (
+    gfx_r = 0.2; gfx_g = 0.6; gfx_b = 0.9;
+    gfx_line(prev_x, prev_y_env_top, x, y_env_top);
+    gfx_line(prev_x, prev_y_env_bot, x, y_env_bot);
+  );
+
+  prev_y_env_top  = y_env_top;
+  prev_y_env_bot  = y_env_bot;
+  prev_y_gain_top = y_gain_top;
+  prev_y_gain_bot = y_gain_bot;
+  prev_x = x;
+  has_prev = 1;
+
+  i += 1;
+);
+
+gfx_r = 0.9; gfx_g = 0.75; gfx_b = 0.2;
+gfx_x = bar_w + 10; gfx_y = max(5, thresh_y_top - 12);
+gfx_drawstr("THRESHOLD");
+
+gfx_r = 1.0; gfx_g = 0.48; gfx_b = 0.1;
+gfx_x = bar_w + 10; gfx_y = 10;
+gfx_drawstr("NORMALIZATION DELTA (ORANGE)");
+
+gfx_r = 0.2; gfx_g = 0.6; gfx_b = 0.9;
+gfx_x = bar_w + 260; gfx_y = 10;
+gfx_drawstr("INCOMING ENVELOPE");
